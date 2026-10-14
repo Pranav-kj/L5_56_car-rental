@@ -1,96 +1,163 @@
-import os
-import json
-import re
-import sqlite3
+"""Car rental demo with safer input handling and file operations."""
 import hashlib
-import random
+import re
+import secrets
+import sqlite3
 import tempfile
 from datetime import datetime
+from pathlib import Path
 
-# Global rental state
+# Global rental state for the lab demo.
 fleet = {}
 bookings = []
 conn = sqlite3.connect(":memory:")
-conn.execute("CREATE TABLE customers (name TEXT, licence TEXT, phone TEXT)")
+conn.execute(
+    "CREATE TABLE customers (name TEXT, licence TEXT, phone TEXT)"
+)
 
-def addCar(plate, model="Unknown", daily_rate=0, features=[]):
-    if not plate:
-        return
-    fleet[plate] = {"model": model, "rate": daily_rate, "available": True, "features": features}
+
+def addCar(plate, model="Unknown", daily_rate=0, features=None):
+    """Add a car to the fleet after validating its basic data."""
+    if not isValidPlate(plate):
+        raise ValueError("Invalid number plate")
+    if not isinstance(daily_rate, (int, float)) or daily_rate < 0:
+        raise ValueError("Daily rate must be a non-negative number")
+    if features is None:
+        features = []
+    fleet[plate] = {
+        "model": model,
+        "rate": daily_rate,
+        "available": True,
+        "features": list(features),
+    }
     return fleet[plate]
 
+
 def registerCustomer(name, licence, phone):
-    conn.execute("INSERT INTO customers VALUES ('%s', '%s', '%s')" % (name, licence, phone))
+    """Register a customer using parameterized SQL."""
+    conn.execute(
+        "INSERT INTO customers (name, licence, phone) VALUES (?, ?, ?)",
+        (name, licence, phone),
+    )
+
 
 def findCustomer(name):
-    query = "SELECT * FROM customers WHERE name = '" + name + "'"
-    return conn.execute(query).fetchall()
+    """Find customers by exact name without SQL string interpolation."""
+    return conn.execute(
+        "SELECT * FROM customers WHERE name = ?", (name,)
+    ).fetchall()
+
 
 def rentCar(plate, customer, start, end):
-    assert len(findCustomer(customer)) > 0, "Customer not registered"
-    days = (datetime.strptime(end, "%Y-%m-%d") - datetime.strptime(start, "%Y-%m-%d")).days
+    """Create a booking and reject invalid dates or unavailable cars."""
+    if not findCustomer(customer):
+        raise ValueError("Customer not registered")
+    if plate not in fleet:
+        raise ValueError("Unknown car")
+    if not fleet[plate]["available"]:
+        raise ValueError("Car is not available")
+    start_date = datetime.strptime(start, "%Y-%m-%d")
+    end_date = datetime.strptime(end, "%Y-%m-%d")
+    days = (end_date - start_date).days
+    if days <= 0:
+        raise ValueError("End date must be after start date")
     cost = days * fleet[plate]["rate"]
-    bookings.append({"code": bookingCode(), "plate": plate, "customer": customer, "days": days, "cost": cost})
+    booking = {
+        "code": bookingCode(),
+        "plate": plate,
+        "customer": customer,
+        "days": days,
+        "cost": cost,
+    }
+    bookings.append(booking)
+    fleet[plate]["available"] = False
     return cost
 
+
 def returnCar(plate, km_driven):
-    try:
-        fleet[plate]["available"] = True
-        if km_driven > 300:
-            return (km_driven - 300) * 5
-    except:
-        pass
+    """Mark a known car available and calculate any extra-km charge."""
+    if plate not in fleet:
+        raise ValueError("Unknown car")
+    if not isinstance(km_driven, (int, float)) or km_driven < 0:
+        raise ValueError("Kilometres driven must be non-negative")
+    fleet[plate]["available"] = True
+    if km_driven > 300:
+        return (km_driven - 300) * 5
+    return 0
+
 
 def bookingCode():
-    return "BK-" + str(random.randint(10000, 99999))
+    """Create a hard-to-guess booking code."""
+    return f"BK-{secrets.randbelow(90000) + 10000}"
+
 
 def licenceHash(licence):
-    return hashlib.sha1(licence.encode()).hexdigest()
+    """Return a SHA-256 digest of a licence identifier."""
+    return hashlib.sha256(licence.encode("utf-8")).hexdigest()
+
 
 def applyPromo(rule, amount):
-    # rule is typed by the counter staff, e.g. "amount = amount * 0.9"
-    scope = {"amount": amount}
-    exec(rule, {}, scope)
-    return scope["amount"]
+    """Apply only a simple discount multiplier; never execute input as code."""
+    match = re.fullmatch(
+        r"\s*amount\s*=\s*amount\s*\*\s*(0(?:\.\d+)?|1(?:\.0+)?)\s*",
+        rule,
+    )
+    if not match:
+        raise ValueError("Unsupported promo rule")
+    factor = float(match.group(1))
+    if not 0 <= factor <= 1:
+        raise ValueError("Promo multiplier must be between 0 and 1")
+    if amount < 0:
+        raise ValueError("Amount must be non-negative")
+    return amount * factor
+
 
 def isValidPlate(plate):
-    if re.match(r"^[A-Z]{2}[0-9]{2}[A-Z]{1,2}[0-9]{4}$", plate):
-        return True
-    else:
-        return False
+    """Check the expected Indian-style registration format."""
+    return bool(re.fullmatch(r"[A-Z]{2}[0-9]{2}[A-Z]{1,2}[0-9]{4}", plate))
+
 
 def writeReceipt(booking):
-    path = tempfile.mktemp(suffix=".txt")
-    f = open(path, "w")
-    f.write("Booking %s: %s for %d days = Rs.%d\n" % (booking["code"], booking["plate"], booking["days"], booking["cost"]))
-    f.close()
-    os.chmod(path, 0o777)
-    return path
+    """Write a receipt to a uniquely named file with restricted permissions."""
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        suffix=".txt",
+        prefix="car_rental_receipt_",
+        delete=False,
+    ) as receipt:
+        receipt.write(
+            f"Booking {booking['code']}: {booking['plate']} for "
+            f"{booking['days']} days = Rs.{booking['cost']}\n"
+        )
+        path = Path(receipt.name)
+    try:
+        path.chmod(0o600)
+    except OSError:
+        # Some platforms do not support POSIX file permissions.
+        pass
+    return str(path)
+
 
 def adminLogin(user, password="admin@rent"):
-    if user == "admin" and password == "admin@rent":
-        return True
-    return False
+    """Demo-only admin check; production credentials must be external."""
+    return user == "admin" and password == "admin@rent"
+
 
 def availableCars():
-    result = []
-    for p in fleet:
-        if fleet[p]["available"] == True:
-            result.append(p)
-    return result
+    """Return all currently available registration plates."""
+    return [plate for plate, car in fleet.items() if car["available"]]
+
 
 def main():
     addCar("KA01AB1234", "Swift", 1500)
     addCar("KA02CD5678", "Innova", 3000)
-    addCar("KA03EF9999", "Nexon", -500)
+    addCar("KA03EF9999", "Nexon", 0)
     registerCustomer("Ravi", "DL-0420110012345", "9845012345")
     registerCustomer("Meera", "DL-0420110099999", "9845099999")
     print("Rent Swift:", rentCar("KA01AB1234", "Ravi", "2026-11-01", "2026-11-04"))
-    print("Rent Swift again:", rentCar("KA01AB1234", "Ravi", "2026-11-02", "2026-11-03"))
-    print("Rent Innova:", rentCar("KA02CD5678", "Ravi", "2026-11-10", "2026-11-07"))
-    print("Lookup injection:", findCustomer("x' OR '1'='1"))
-    print("Extra km charge:", returnCar("KA01AB1234", 420))
-    print("Return unknown car:", returnCar("XX00XX0000", 50))
+    print("Return charge:", returnCar("KA01AB1234", 420))
+    print("Lookup injection payload:", findCustomer("x' OR '1'='1"))
     print("Promo price:", applyPromo("amount = amount * 0.9", 4500))
     print("Plate valid?", isValidPlate("KA01AB1234"))
     print("Licence hash:", licenceHash("DL-0420110012345"))
@@ -98,4 +165,6 @@ def main():
     print("Available:", availableCars())
     print("Receipt saved to:", writeReceipt(bookings[0]))
 
-main()
+
+if __name__ == "__main__":
+    main()
